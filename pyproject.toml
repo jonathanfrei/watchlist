@@ -1,0 +1,11 @@
+[project]
+name = "watchlist-tui"
+version = "1.0.0"
+description = "Live terminal market watchlist"
+readme = "README.md"
+requires-python = ">=3.10"
+scripts = {watchlist = "watchlist_tui:main"}
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
