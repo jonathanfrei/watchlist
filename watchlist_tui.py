@@ -490,7 +490,7 @@ class App:
             self.ensure_detail()
 
     def ensure_detail(self) -> None:
-        self.submit(ASSETS[self.selected], self.range_label)
+        self.submit(self.assets[self.selected], self.range_label)
 
     def draw(self) -> None:
         self.screen.erase()
@@ -541,7 +541,7 @@ class App:
                 self.text(y + 1, left + 2, name[: width - 4], attr | self.color(4))
 
     def draw_detail(self, top: int, left: int, height: int, width: int) -> None:
-        symbol, name, currency = ASSETS[self.selected]
+        symbol, name, currency = self.assets[self.selected]
         quote = self.quotes.get((symbol, self.range_label))
         fallback = self.quotes.get((symbol, "1Y"))
         if quote is None and self.range_label == "1Y":
