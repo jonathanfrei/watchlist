@@ -35,7 +35,7 @@ DEFAULT_ASSETS = [
 RANGES = {
     "1D": ("1d", "5m"), "1W": ("5d", "30m"), "1M": ("1mo", "1d"),
     "3M": ("3mo", "1d"), "6M": ("6mo", "1d"), "1Y": ("1y", "1d"),
-    "5Y": ("5y", "1wk"),
+    "5Y": ("5y", "1wk"), "10Y": ("10y", "1wk"),
 }
 CACHE_PATH = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "market-watchlist" / "data.json"
 CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "market-watchlist" / "config.json"
@@ -84,6 +84,18 @@ class Quote:
     @property
     def percent(self) -> float:
         return (self.price - self.previous) / self.previous * 100 if self.previous else 0.0
+
+    @property
+    def period_start(self) -> float:
+        return self.points[0][1] if self.points else self.price
+
+    @property
+    def period_change(self) -> float:
+        return self.price - self.period_start
+
+    @property
+    def period_percent(self) -> float:
+        return self.period_change / self.period_start * 100 if self.period_start else 0.0
 
 
 def parse_quote(symbol: str, name: str, currency: str, payload: dict[str, Any], headers: Any) -> Quote:
@@ -166,7 +178,7 @@ def quote_from_series(asset: tuple[str, str, str], source: str, exchange: str,
 
 
 def coin_gecko_quote(asset: tuple[str, str, str], range_label: str, timeout: float) -> Quote:
-    days = {"1D": 1, "1W": 5, "1M": 30, "3M": 90, "6M": 180, "1Y": 365, "5Y": 1825}[range_label]
+    days = {"1D": 1, "1W": 5, "1M": 30, "3M": 90, "6M": 180, "1Y": 365, "5Y": 1825, "10Y": 3650}[range_label]
     query = urllib.parse.urlencode({"vs_currency": "usd", "days": days, "precision": "full"})
     payload, _ = read_json(f"https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?{query}", timeout)
     prices = payload["prices"]
@@ -188,12 +200,12 @@ def nasdaq_quote(asset: tuple[str, str, str], range_label: str, timeout: float) 
         close = [float(point["y"]) for point in chart]
         previous = number(str(data.get("previousClose", "")).replace("$", "").replace(",", ""))
         return quote_from_series(asset, "Nasdaq", data.get("exchange", "US Market"), timestamps, close, previous=previous)
-    days = {"1W": 10, "1M": 40, "3M": 110, "6M": 210, "1Y": 380, "5Y": 1900}[range_label]
+    days = {"1W": 10, "1M": 40, "3M": 110, "6M": 210, "1Y": 380, "5Y": 1900, "10Y": 3650}[range_label]
     end = dt.date.today(); start = end - dt.timedelta(days=days)
-    query = urllib.parse.urlencode({"assetclass": "etf", "fromdate": start.isoformat(), "todate": end.isoformat(), "limit": 1400 if range_label == "5Y" else 500})
+    query = urllib.parse.urlencode({"assetclass": "etf", "fromdate": start.isoformat(), "todate": end.isoformat(), "limit": 1400 if range_label in ("5Y", "10Y") else 500})
     payload, _ = read_json(f"https://api.nasdaq.com/api/quote/{urllib.parse.quote(symbol)}/historical?{query}", timeout, headers)
     rows = list(reversed(payload["data"]["tradesTable"]["rows"]))
-    if range_label == "5Y":
+    if range_label in ("5Y", "10Y"):
         rows = [row for index, row in enumerate(rows) if index % 5 == 0 or index == len(rows) - 1]
     numeric = lambda value: float(str(value).replace("$", "").replace(",", ""))
     timestamps = [int(dt.datetime.strptime(row["date"], "%m/%d/%Y").replace(tzinfo=dt.timezone(dt.timedelta(hours=-4))).timestamp()) for row in rows]
@@ -206,7 +218,7 @@ def nasdaq_quote(asset: tuple[str, str, str], range_label: str, timeout: float) 
 def twelve_data_quote(asset: tuple[str, str, str], range_label: str, timeout: float) -> Quote:
     symbol = "BTC/USD" if asset[0] == "BTC-USD" else asset[0]
     interval = {"5m": "5min", "30m": "30min", "1d": "1day", "1wk": "1week"}[RANGES[range_label][1]]
-    count = {"1D": 96, "1W": 240, "1M": 31, "3M": 93, "6M": 186, "1Y": 366, "5Y": 262}[range_label]
+    count = {"1D": 96, "1W": 240, "1M": 31, "3M": 93, "6M": 186, "1Y": 366, "5Y": 262, "10Y": 520}[range_label]
     query = urllib.parse.urlencode({"symbol": symbol, "interval": interval, "outputsize": count, "order": "asc", "timezone": "UTC", "apikey": os.environ["TWELVE_DATA_API_KEY"]})
     payload, _ = read_json(f"https://api.twelvedata.com/time_series?{query}", timeout)
     rows = payload["values"]
@@ -524,9 +536,9 @@ class App:
             self.text(y, left + 2, symbol, attr | curses.A_BOLD)
             if quote:
                 price = money(quote.price, quote.currency)
-                change = f"{quote.percent:+.2f}%"
+                change = f"{quote.period_percent:+.2f}%"
                 self.right(y, left + width - 2, price, attr | curses.A_BOLD)
-                change_attr = attr | self.color(1 if quote.percent >= 0 else 2)
+                change_attr = attr | self.color(1 if quote.period_percent >= 0 else 2)
                 spark_width = max(4, min(12, width - len(name) - len(change) - 8))
                 spark = sparkline([p[1] for p in quote.points[-80:]], spark_width)
                 if selected:
@@ -552,12 +564,12 @@ class App:
         if not quote:
             self.text(top + 4, left + 2, "Loading chart…" if (symbol, self.range_label) in self.pending else "Market data unavailable", self.color(6))
             return
-        move = quote.price - quote.previous
+        move = quote.period_change
+        period = quote.period_percent
         self.text(top + 3, left + 2, money(quote.price, quote.currency), curses.A_BOLD)
-        self.text(top + 4, left + 2, f"{move:+,.2f}  {quote.percent:+.2f}%", self.color(1 if move >= 0 else 2) | curses.A_BOLD)
+        self.text(top + 4, left + 2, f"{move:+,.2f}  {period:+.2f}%", self.color(1 if move >= 0 else 2) | curses.A_BOLD)
         self.right(top + 3, left + width - 2, quote.exchange, self.color(4))
         values = [point[1] for point in quote.points]
-        period = (values[-1] - values[0]) / values[0] * 100
         chart_top = top + 7
         stats_height = 5
         chart_height = max(3, height - chart_top - stats_height - 3)
@@ -569,7 +581,7 @@ class App:
         chart_attr = self.color(1 if period >= 0 else 2)
         for row, line in enumerate(chart):
             self.text(chart_top + row, left + 13, line, chart_attr)
-        date_fmt = "%b %d" if self.range_label != "5Y" else "%b %Y"
+        date_fmt = "%b %d" if self.range_label not in ("5Y", "10Y") else "%b %Y" if self.range_label == "5Y" else "%Y"
         self.text(chart_top + chart_height, left + 13, dt.datetime.fromtimestamp(quote.points[0][0]).strftime(date_fmt), self.color(4))
         self.right(chart_top + chart_height, left + width - 2, dt.datetime.fromtimestamp(quote.points[-1][0]).strftime(date_fmt), self.color(4))
         range_y = chart_top + chart_height + 2
