@@ -22,7 +22,7 @@ from typing import Any
 
 
 YAHOO_ENDPOINT = "https://query2.finance.yahoo.com/v8/finance/chart"
-ASSETS = [
+DEFAULT_ASSETS = [
     ("BTC-USD", "Bitcoin USD", "USD"),
     ("0992.HK", "Lenovo Group", "HKD"),
     ("VOO", "Vanguard S&P 500 ETF", "USD"),
@@ -38,7 +38,30 @@ RANGES = {
     "5Y": ("5y", "1wk"),
 }
 CACHE_PATH = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "market-watchlist" / "data.json"
+CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "market-watchlist" / "config.json"
 SPARKS = "▁▂▃▄▅▆▇█"
+
+
+def load_config() -> list[tuple[str, str, str]]:
+    try:
+        raw = json.loads(CONFIG_PATH.read_text())
+        assets = raw.get("assets")
+        if isinstance(assets, list) and assets:
+            return [(a["symbol"], a["name"], a["currency"]) for a in assets if all(k in a for k in ("symbol", "name", "currency"))]
+    except (OSError, ValueError, TypeError):
+        pass
+    return DEFAULT_ASSETS
+
+
+def save_config(assets: list[tuple[str, str, str]]) -> None:
+    try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        data = {"assets": [{"symbol": s, "name": n, "currency": c} for s, n, c in assets]}
+        temp = CONFIG_PATH.with_suffix(".tmp")
+        temp.write_text(json.dumps(data, indent=2))
+        temp.replace(CONFIG_PATH)
+    except OSError:
+        pass
 
 
 @dataclass
@@ -254,6 +277,7 @@ def braille_chart(values: list[float], width: int, height: int) -> list[str]:
 class App:
     def __init__(self, screen: Any):
         self.screen = screen
+        self.assets = load_config()
         self.selected = 0
         self.range_index = list(RANGES).index("1Y")
         self.quotes: dict[tuple[str, str], Quote] = {}
@@ -301,10 +325,8 @@ class App:
         if not force and time.monotonic() - self.last_refresh < 10:
             return
         self.last_refresh = time.monotonic()
-        for asset in ASSETS:
-            self.submit(asset, "1Y")
-        if self.range_label != "1Y":
-            self.submit(ASSETS[self.selected], self.range_label)
+        for asset in self.assets:
+            self.submit(asset, self.range_label)
         self.message = "Refreshing live prices…"
 
     def drain_results(self) -> None:
@@ -322,8 +344,8 @@ class App:
                 self.errors[key] = str(error)
             changed = True
         if changed:
-            available = sum((asset[0], "1Y") in self.quotes for asset in ASSETS)
-            self.message = f"Live · {available}/{len(ASSETS)} quotes · auto-refresh 5m"
+            available = sum((asset[0], self.range_label) in self.quotes for asset in self.assets)
+            self.message = f"Live · {available}/{len(self.assets)} quotes · auto-refresh 5m"
             self.save_cache()
 
     def load_cache(self) -> None:
@@ -370,9 +392,11 @@ class App:
         if key in (ord("q"), ord("Q"), 3):
             self.running = False
         elif key in (curses.KEY_UP, ord("k")):
-            self.selected = (self.selected - 1) % len(ASSETS); self.ensure_detail()
+            if key == curses.KEY_UP and curses.keyname(key) == b'KEY_UP':
+                pass
+            self.selected = (self.selected - 1) % len(self.assets); self.ensure_detail()
         elif key in (curses.KEY_DOWN, ord("j")):
-            self.selected = (self.selected + 1) % len(ASSETS); self.ensure_detail()
+            self.selected = (self.selected + 1) % len(self.assets); self.ensure_detail()
         elif key in (curses.KEY_LEFT, ord("h")):
             if width < 90 and self.detail_only:
                 self.detail_only = False
@@ -393,6 +417,14 @@ class App:
                 self.running = False
         elif key in (ord("r"), ord("R")):
             self.refresh_all(True)
+        elif key in (ord("a"), ord("A")):
+            self.add_asset()
+        elif key in (ord("d"), ord("D")):
+            self.remove_asset()
+        elif key in (ord("J"),):  # Shift+J to move down
+            self.move_asset(1)
+        elif key in (ord("K"),):  # Shift+K to move up
+            self.move_asset(-1)
         elif key == curses.KEY_MOUSE:
             self.handle_mouse()
 
@@ -403,12 +435,59 @@ class App:
             return
         height, width = self.screen.getmaxyx()
         if state & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED):
-            if (width >= 90 or not self.detail_only) and 4 <= y < 4 + len(ASSETS) * 3:
+            if (width >= 90 or not self.detail_only) and 4 <= y < 4 + len(self.assets) * 3:
                 index = (y - 4) // 3
-                if 0 <= index < len(ASSETS):
+                if 0 <= index < len(self.assets):
                     self.selected = index; self.ensure_detail()
                     if width < 90:
                         self.detail_only = True
+
+    def add_asset(self) -> None:
+        curses.echo()
+        curses.curs_set(1)
+        self.screen.keypad(False)
+        height, width = self.screen.getmaxyx()
+        self.text(height - 2, 2, "Add symbol (e.g. AAPL): ", self.color(3))
+        self.screen.refresh()
+        try:
+            symbol = self.screen.getstr(height - 2, 26, 16).decode().strip().upper()
+        except Exception:
+            symbol = ""
+        curses.noecho()
+        curses.curs_set(0)
+        self.screen.keypad(True)
+        if not symbol:
+            self.message = "Cancelled"
+            return
+        name = symbol
+        currency = "USD"
+        self.assets.insert(self.selected + 1, (symbol, name, currency))
+        self.selected += 1
+        save_config(self.assets)
+        self.ensure_detail()
+        self.refresh_all(True)
+        self.message = f"Added {symbol}"
+
+    def remove_asset(self) -> None:
+        if len(self.assets) <= 1:
+            self.message = "Cannot remove last asset"
+            return
+        symbol = self.assets[self.selected][0]
+        del self.assets[self.selected]
+        if self.selected >= len(self.assets):
+            self.selected = len(self.assets) - 1
+        save_config(self.assets)
+        self.ensure_detail()
+        self.refresh_all(True)
+        self.message = f"Removed {symbol}"
+
+    def move_asset(self, direction: int) -> None:
+        new_index = self.selected + direction
+        if 0 <= new_index < len(self.assets):
+            self.assets[self.selected], self.assets[new_index] = self.assets[new_index], self.assets[self.selected]
+            self.selected = new_index
+            save_config(self.assets)
+            self.ensure_detail()
 
     def ensure_detail(self) -> None:
         self.submit(ASSETS[self.selected], self.range_label)
@@ -435,15 +514,13 @@ class App:
     def draw_watchlist(self, top: int, left: int, height: int, width: int) -> None:
         self.text(top + 1, left + 2, "MARKETS", self.color(3) | curses.A_BOLD)
         self.text(top + 2, left + 2, "Watchlist", curses.A_BOLD)
-        for index, (symbol, name, currency) in enumerate(ASSETS):
+        for index, (symbol, name, currency) in enumerate(self.assets):
             y = top + 4 + index * 3
             if y + 1 >= top + height:
                 break
             selected = index == self.selected
             attr = self.color(5) if selected else curses.A_NORMAL
-            if selected:
-                self.fill(y, left + 1, width - 2, 2, attr)
-            quote = self.quotes.get((symbol, "1Y"))
+            quote = self.quotes.get((symbol, self.range_label))
             self.text(y, left + 2, symbol, attr | curses.A_BOLD)
             if quote:
                 price = money(quote.price, quote.currency)
@@ -452,11 +529,15 @@ class App:
                 change_attr = attr | self.color(1 if quote.percent >= 0 else 2)
                 spark_width = max(4, min(12, width - len(name) - len(change) - 8))
                 spark = sparkline([p[1] for p in quote.points[-80:]], spark_width)
+                if selected:
+                    self.fill(y, left + 1, width - 2, 1, attr)
                 self.text(y + 1, left + 2, name[: max(1, width - spark_width - len(change) - 8)], attr | self.color(4))
                 self.right(y + 1, left + width - 2, f"{spark} {change}", change_attr)
             else:
-                label = "loading…" if (symbol, "1Y") in self.pending else "unavailable"
+                label = "loading…" if (symbol, self.range_label) in self.pending else "unavailable"
                 self.right(y, left + width - 2, label, attr | self.color(6))
+                if selected:
+                    self.fill(y, left + 1, width - 2, 1, attr)
                 self.text(y + 1, left + 2, name[: width - 4], attr | self.color(4))
 
     def draw_detail(self, top: int, left: int, height: int, width: int) -> None:
@@ -506,7 +587,7 @@ class App:
         self.text(min(top + height - 1, stat_y + 3), left + 2, status[: width - 4], self.color(4))
 
     def draw_footer(self, y: int, width: int) -> None:
-        help_text = " ↑/↓ select   ←/→ range   r refresh   q quit "
+        help_text = " ↑/↓ select   ←/→ range   a add   d remove   J/K reorder   r refresh   q quit "
         status = f" {self.message} "
         try:
             self.screen.addstr(y, 0, " " * (width - 1), curses.A_REVERSE)
@@ -551,8 +632,9 @@ def parse_time(value: str) -> str:
 def smoke_test() -> int:
     print("Fetching independent market sources …")
     failures = 0
+    assets = load_config()
     with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
-        futures = {executor.submit(fetch_quote, asset, "1Y"): asset[0] for asset in ASSETS}
+        futures = {executor.submit(fetch_quote, asset, "1Y"): asset[0] for asset in assets}
         for future in concurrent.futures.as_completed(futures):
             symbol = futures[future]
             try:
