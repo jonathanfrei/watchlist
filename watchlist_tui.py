@@ -455,24 +455,60 @@ class App:
                         self.detail_only = True
 
     def add_asset(self) -> None:
-        curses.echo()
-        curses.curs_set(1)
-        self.screen.keypad(False)
         height, width = self.screen.getmaxyx()
-        self.text(height - 2, 2, "Add symbol (e.g. AAPL): ", self.color(3))
+        prompt = "Add symbol (e.g. AAPL): "
+        input_x = 2 + len(prompt)
+        max_len = 16
+        # Switch to blocking input so getstr waits for the user (timeout(100) would otherwise make it blink/cancel in ~100ms)
+        try:
+            curses.curs_set(1)
+        except curses.error:
+            pass
+        curses.echo()
+        self.screen.keypad(False)
+        self.screen.timeout(-1)
+        # Clear and draw prompt on the line above the footer
+        try:
+            self.screen.move(height - 2, 0)
+            self.screen.clrtoeol()
+        except curses.error:
+            pass
+        self.text(height - 2, 2, prompt, self.color(3) | curses.A_BOLD)
+        self.text(height - 2, input_x, " " * max_len, curses.A_NORMAL)
         self.screen.refresh()
         try:
-            symbol = self.screen.getstr(height - 2, 26, 16).decode().strip().upper()
+            raw = self.screen.getstr(height - 2, input_x, max_len)
+            symbol = raw.decode().strip().upper() if raw else ""
         except Exception:
             symbol = ""
-        curses.noecho()
-        curses.curs_set(0)
-        self.screen.keypad(True)
+        finally:
+            curses.noecho()
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
+            self.screen.keypad(True)
+            self.screen.timeout(100)
+            # Clear prompt line so it doesn't linger after input
+            try:
+                self.screen.move(height - 2, 0)
+                self.screen.clrtoeol()
+            except curses.error:
+                pass
         if not symbol:
             self.message = "Cancelled"
             return
+        # Basic ticker validation: allow A-Z, 0-9, ., -, ^, = (covers US, HK, etc.) and length 1..16
+        allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-^=")
+        if len(symbol) > max_len or any(ch not in allowed for ch in symbol):
+            self.message = f"Invalid symbol: {symbol}"
+            return
+        if any(s == symbol for s, _, _ in self.assets):
+            self.message = f"{symbol} already in watchlist"
+            return
         name = symbol
-        currency = "USD"
+        # Infer HKD for .HK suffix, otherwise USD
+        currency = "HKD" if symbol.endswith(".HK") else "USD"
         self.assets.insert(self.selected + 1, (symbol, name, currency))
         self.selected += 1
         save_config(self.assets)
