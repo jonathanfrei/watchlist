@@ -9,6 +9,7 @@ import curses
 import datetime as dt
 import json
 import locale
+import math
 import os
 import queue
 import sys
@@ -99,20 +100,42 @@ class Quote:
 
 
 def parse_quote(symbol: str, name: str, currency: str, payload: dict[str, Any], headers: Any) -> Quote:
-    result = payload["chart"]["result"][0]
-    meta = result["meta"]
-    raw_quote = result["indicators"]["quote"][0]
-    adjusted = result["indicators"].get("adjclose", [{}])[0].get("adjclose", [])
+    # P1: validate Yahoo's envelope before indexing — an error payload such as
+    # {"chart": {"result": None, "error": {...}}} previously raised a bare
+    # TypeError ('NoneType' is not subscriptable) with no symbol context.
+    try:
+        chart = payload.get("chart", {}) if isinstance(payload, dict) else {}
+        results = chart.get("result")
+        if not results:
+            error = chart.get("error") or {}
+            reason = error.get("description") or error.get("code") or "empty result"
+            raise ValueError(f"Yahoo returned no result for {symbol}: {reason}")
+        result = results[0]
+        meta = result.get("meta") or {}
+        indicators = result.get("indicators") or {}
+        quotes = indicators.get("quote") or [{}]
+        raw_quote = quotes[0] or {}
+        adjusted = (indicators.get("adjclose") or [{}])[0].get("adjclose", []) or []
+        stamps = result.get("timestamp") or []
+    except (AttributeError, IndexError, KeyError) as error:
+        raise ValueError(f"malformed market response for {symbol}: {error}") from error
     points = []
-    for index, stamp in enumerate(result["timestamp"]):
-        close = adjusted[index] if index < len(adjusted) else raw_quote["close"][index]
-        if close is not None:
-            points.append((int(stamp), float(close)))
+    for index, stamp in enumerate(stamps):
+        try:
+            close = adjusted[index] if index < len(adjusted) else raw_quote.get("close", [])[index]
+        except IndexError:
+            continue
+        if close is not None and number(close) is not None:
+            points.append((int(stamp), float(close)))  # type: ignore[arg-type]
     if len(points) < 2:
-        raise ValueError("market response contains fewer than two prices")
-    last = lambda key: next((v for v in reversed(raw_quote.get(key, [])) if v is not None), None)
+        raise ValueError(f"market response for {symbol} contains fewer than two prices")
+    last = lambda key: next((v for v in reversed(raw_quote.get(key, []) or []) if v is not None), None)
     value = lambda key, fallback=None: meta.get(key) if meta.get(key) is not None else fallback
-    current_price = float(value("regularMarketPrice", points[-1][1]))
+    # P1: regularMarketPrice may be missing/null — fall back to the last chart
+    # close instead of raising float(None).
+    current_price = number(value("regularMarketPrice", points[-1][1]))
+    if current_price is None:
+        raise ValueError(f"market response for {symbol} has no usable price")
     daily_percent = number(meta.get("regularMarketChangePercent"))
     daily_previous = current_price / (1 + daily_percent / 100) if daily_percent is not None and daily_percent != -100 else None
     return Quote(
@@ -130,10 +153,21 @@ def parse_quote(symbol: str, name: str, currency: str, payload: dict[str, Any], 
 
 
 def number(value: Any) -> float | None:
+    # P1: lenient scalar parser — one bad/"N/A" field must not kill the app.
+    # Strips common decorations ($, commas, whitespace) and treats
+    # empty/missing sentinels as None instead of raising.
+    if value is None:
+        return None
+    if isinstance(value, str):
+        cleaned = value.strip().replace("$", "").replace(",", "")
+        if cleaned.lower() in ("", "n/a", "na", "null", "none", "-", "--", "—"):
+            return None
+        value = cleaned
     try:
-        return float(value) if value is not None else None
+        result = float(value)
     except (TypeError, ValueError):
         return None
+    return result if math.isfinite(result) else None
 
 
 def read_json(url: str, timeout: float, headers: dict[str, str] | None = None) -> tuple[dict[str, Any], Any]:
@@ -169,8 +203,12 @@ def quote_from_series(asset: tuple[str, str, str], source: str, exchange: str,
                       highs: list[float] | None = None, lows: list[float] | None = None,
                       volumes: list[float | None] | None = None, previous: float | None = None) -> Quote:
     symbol, name, currency = asset
+    # P1: validate fallback series — mismatched/empty/non-finite series
+    # previously surfaced as bare IndexErrors deep in draw code.
     if len(close) < 2:
-        raise ValueError("source returned fewer than two prices")
+        raise ValueError(f"{source} returned fewer than two prices for {symbol}")
+    if len(timestamps) != len(close):
+        raise ValueError(f"{source} returned mismatched timestamps/prices for {symbol}")
     opens = opens or close; highs = highs or close; lows = lows or close; volumes = volumes or [None] * len(close)
     return Quote(symbol, name, currency, exchange, source, dt.datetime.now(dt.UTC).isoformat(),
                  close[-1], previous or close[-2], opens[-1], highs[-1], lows[-1], volumes[-1],
@@ -300,6 +338,7 @@ class App:
         self.message = "Connecting to live markets…"
         self.detail_only = False
         self.last_refresh = 0.0
+        self.last_ok_wall = 0.0  # P4: wall-clock time of the last batch with ≥1 success
         self.running = True
         self.load_cache()
 
@@ -343,6 +382,7 @@ class App:
 
     def drain_results(self) -> None:
         changed = False
+        successes = 0
         while True:
             try:
                 key, future = self.results.get_nowait()
@@ -350,14 +390,36 @@ class App:
                 break
             self.pending.discard(key)
             try:
-                self.quotes[key] = future.result()
+                quote = future.result()
+                quote.stale = False  # P2: fresh fetch clears the cached flag
+                self.quotes[key] = quote
                 self.errors.pop(key, None)
+                successes += 1
             except Exception as error:
                 self.errors[key] = str(error)
+                # P2: keep the last-good quote but flag it stale so the UI
+                # never presents a previous close as a live price.
+                existing = self.quotes.get(key)
+                if existing is not None:
+                    existing.stale = True
             changed = True
         if changed:
-            available = sum((asset[0], self.range_label) in self.quotes for asset in self.assets)
-            self.message = f"Live · {available}/{len(self.assets)} quotes · auto-refresh 5m"
+            if successes:
+                self.last_ok_wall = time.time()  # P4: drive "last ok" + behind hints
+            live = sum(
+                (asset[0], self.range_label) in self.quotes
+                and not self.quotes[(asset[0], self.range_label)].stale
+                for asset in self.assets
+            )
+            stale = sum(
+                (asset[0], self.range_label) in self.quotes
+                and self.quotes[(asset[0], self.range_label)].stale
+                for asset in self.assets
+            )
+            stale_suffix = f" · {stale} stale" if stale else ""
+            self.message = (
+                f"Live · {live}/{len(self.assets)} quotes{stale_suffix} · auto-refresh 5m"
+            )
             self.save_cache()
 
     def load_cache(self) -> None:
@@ -390,7 +452,14 @@ class App:
             self.drain_results()
             if time.monotonic() - self.last_refresh >= 300:
                 self.refresh_all(True)
-            self.draw()
+            # P3: never let one bad frame (resize race, corrupt quote)
+            # escape the main loop and kill the session.
+            try:
+                self.draw()
+            except curses.error:
+                pass
+            except Exception:
+                pass
             try:
                 key = self.screen.getch()
             except KeyboardInterrupt:
@@ -557,36 +626,66 @@ class App:
         else:
             self.draw_watchlist(0, 0, height - 1, width)
         self.draw_footer(height - 1, width)
-        self.screen.refresh()
+        # P3: a resize racing the final refresh previously raised curses.error
+        # out of the frame and killed the TUI — degrade, don't exit.
+        try:
+            self.screen.refresh()
+        except curses.error:
+            pass
 
     def draw_watchlist(self, top: int, left: int, height: int, width: int) -> None:
         self.text(top + 1, left + 2, "MARKETS", self.color(3) | curses.A_BOLD)
         self.text(top + 2, left + 2, "Watchlist", curses.A_BOLD)
-        for index, (symbol, name, currency) in enumerate(self.assets):
-            y = top + 4 + index * 3
+        # P3: scroll the list so the selection is always visible instead of
+        # silently drifting below the fold on small terminals / long lists.
+        row_h = 3
+        usable = max(row_h, height - 4)
+        max_visible = max(1, usable // row_h)
+        total = len(self.assets)
+        if total <= max_visible:
+            start = 0
+        else:
+            start = min(max(0, self.selected - max_visible // 2), total - max_visible)
+        for slot, index in enumerate(range(start, min(total, start + max_visible))):
+            (symbol, name, currency) = self.assets[index]
+            y = top + 4 + slot * row_h
             if y + 1 >= top + height:
                 break
-            selected = index == self.selected
-            attr = self.color(5) if selected else curses.A_NORMAL
-            quote = self.quotes.get((symbol, self.range_label))
-            self.text(y, left + 2, symbol, attr | curses.A_BOLD)
-            if quote:
-                price = money(quote.price, quote.currency)
-                change = f"{quote.period_percent:+.2f}%"
-                self.right(y, left + width - 2, price, attr | curses.A_BOLD)
-                change_attr = attr | self.color(1 if quote.period_percent >= 0 else 2)
-                spark_width = max(4, min(12, width - len(name) - len(change) - 8))
-                spark = sparkline([p[1] for p in quote.points[-80:]], spark_width)
-                if selected:
-                    self.fill(y, left + 1, width - 2, 1, attr)
-                self.text(y + 1, left + 2, name[: max(1, width - spark_width - len(change) - 8)], attr | self.color(4))
-                self.right(y + 1, left + width - 2, f"{spark} {change}", change_attr)
-            else:
-                label = "loading…" if (symbol, self.range_label) in self.pending else "unavailable"
-                self.right(y, left + width - 2, label, attr | self.color(6))
-                if selected:
-                    self.fill(y, left + 1, width - 2, 1, attr)
-                self.text(y + 1, left + 2, name[: width - 4], attr | self.color(4))
+            # P1: one corrupt quote must not abort the whole list draw.
+            try:
+                selected = index == self.selected
+                attr = self.color(5) if selected else curses.A_NORMAL
+                quote = self.quotes.get((symbol, self.range_label))
+                self.text(y, left + 2, symbol, attr | curses.A_BOLD)
+                if quote:
+                    price = money(quote.price, quote.currency)
+                    # P2: surface staleness on the row itself (detail pane
+                    # already shows "· cached"); never bold-print stale as live.
+                    stale_mark = " ~stale" if quote.stale else ""
+                    change = f"{quote.period_percent:+.2f}%{stale_mark}"
+                    self.right(y, left + width - 2, price, attr | curses.A_BOLD)
+                    change_attr = attr | self.color(1 if quote.period_percent >= 0 else 2)
+                    spark_width = max(4, min(12, width - len(name) - len(change) - 8))
+                    spark = sparkline([p[1] for p in quote.points[-80:]], spark_width)
+                    if selected:
+                        self.fill(y, left + 1, width - 2, 1, attr)
+                    self.text(y + 1, left + 2, name[: max(1, width - spark_width - len(change) - 8)], attr | self.color(4))
+                    self.right(y + 1, left + width - 2, f"{spark} {change}", change_attr)
+                else:
+                    label = "loading…" if (symbol, self.range_label) in self.pending else "unavailable"
+                    self.right(y, left + width - 2, label, attr | self.color(6))
+                    if selected:
+                        self.fill(y, left + 1, width - 2, 1, attr)
+                    self.text(y + 1, left + 2, name[: width - 4], attr | self.color(4))
+            except Exception:
+                self.right(y, left + width - 2, "error", self.color(6))
+        # P3: scroll position hint when the list is clipped.
+        if total > max_visible:
+            hidden_below = total - (start + max_visible)
+            if start > 0:
+                self.text(top + 3, left + 2, f"↑ {start} more", self.color(4))
+            if hidden_below > 0:
+                self.text(top + height - 1, left + 2, f"↓ {hidden_below} more", self.color(4))
 
     def draw_detail(self, top: int, left: int, height: int, width: int) -> None:
         symbol, name, currency = self.assets[self.selected]
@@ -600,16 +699,30 @@ class App:
         if not quote:
             self.text(top + 4, left + 2, "Loading chart…" if (symbol, self.range_label) in self.pending else "Market data unavailable", self.color(6))
             return
-        move = quote.period_change
-        period = quote.period_percent
-        self.text(top + 3, left + 2, money(quote.price, quote.currency), curses.A_BOLD)
+        # P1: a corrupt quote (empty points, bad timestamps) must degrade to
+        # an error line, never raise out of the draw loop and kill the TUI.
+        try:
+            values = [point[1] for point in quote.points]
+            if len(values) < 2:
+                raise ValueError("not enough points")
+            move = quote.period_change
+            period = quote.period_percent
+        except Exception:
+            self.text(top + 4, left + 2, "Market data unavailable (bad quote)", self.color(6))
+            return
+        # P2: stale quotes keep last-good numbers but are labelled, not bold-live.
+        price_attr = curses.A_BOLD if not quote.stale else curses.A_NORMAL
+        stale_suffix = " ~stale" if quote.stale else ""
+        self.text(top + 3, left + 2, money(quote.price, quote.currency) + stale_suffix, price_attr)
         self.text(top + 4, left + 2, f"{move:+,.2f}  {period:+.2f}%", self.color(1 if move >= 0 else 2) | curses.A_BOLD)
         self.right(top + 3, left + width - 2, quote.exchange, self.color(4))
-        values = [point[1] for point in quote.points]
         chart_top = top + 7
         stats_height = 5
-        chart_height = max(3, height - chart_top - stats_height - 3)
-        chart_width = max(10, width - 15)
+        # P3: clamp chart geometry to the space actually available; a tiny
+        # pane previously produced negative/huge heights that overflowed.
+        max_chart = max(1, height - (chart_top - top) - stats_height - 3)
+        chart_height = max(1, min(max(3, height - chart_top - stats_height - 3), max_chart))
+        chart_width = max(10, min(width - 15, max(10, width - 15)))
         chart = braille_chart(values, chart_width, chart_height)
         high, low = max(values), min(values)
         self.text(chart_top, left + 2, money(high, quote.currency), self.color(4))
@@ -618,8 +731,14 @@ class App:
         for row, line in enumerate(chart):
             self.text(chart_top + row, left + 13, line, chart_attr)
         date_fmt = "%b %d" if self.range_label not in ("5Y", "10Y") else "%b %Y" if self.range_label == "5Y" else "%Y"
-        self.text(chart_top + chart_height, left + 13, dt.datetime.fromtimestamp(quote.points[0][0]).strftime(date_fmt), self.color(4))
-        self.right(chart_top + chart_height, left + width - 2, dt.datetime.fromtimestamp(quote.points[-1][0]).strftime(date_fmt), self.color(4))
+        # P1: corrupt timestamps fall back to "—" instead of raising.
+        try:
+            start_label = dt.datetime.fromtimestamp(quote.points[0][0]).strftime(date_fmt)
+            end_label = dt.datetime.fromtimestamp(quote.points[-1][0]).strftime(date_fmt)
+        except (ValueError, OSError, OverflowError):
+            start_label = end_label = "—"
+        self.text(chart_top + chart_height, left + 13, start_label, self.color(4))
+        self.right(chart_top + chart_height, left + width - 2, end_label, self.color(4))
         range_y = chart_top + chart_height + 2
         range_text = "  ".join(f"[{label}]" if label == self.range_label else label for label in RANGES)
         self.text(range_y, left + 2, range_text[: width - 4], self.color(3) | curses.A_BOLD)
@@ -636,7 +755,21 @@ class App:
 
     def draw_footer(self, y: int, width: int) -> None:
         help_text = " ↑/↓ select   ←/→ range   a add   d remove   J/K reorder   r refresh   q quit "
+        # P4: honest refresh status — "last ok HH:MM" plus an explicit
+        # "behind schedule" flag when the 5m auto-refresh has slipped, so a
+        # stalled loop can never pretend it is live.
         status = f" {self.message} "
+        try:
+            overdue = time.monotonic() - self.last_refresh > 330 and self.last_refresh > 0
+            ok_hint = ""
+            if self.last_ok_wall:
+                ok_hint = dt.datetime.fromtimestamp(self.last_ok_wall).strftime(" · ok %-I:%M %p")
+            if overdue:
+                status = f" {self.message}{ok_hint} · behind schedule "
+            elif ok_hint and "Live" in self.message:
+                status = f" {self.message}{ok_hint} "
+        except Exception:
+            pass
         try:
             self.screen.addstr(y, 0, " " * (width - 1), curses.A_REVERSE)
             self.screen.addnstr(y, 1, help_text, width - 2, curses.A_REVERSE)
